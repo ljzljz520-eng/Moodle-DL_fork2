@@ -1,7 +1,13 @@
+import hashlib
+import json
 import logging
+import os
+import socket
 import sqlite3
+import time
+import uuid
 from sqlite3 import Error
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from moodle_dl.config import ConfigHelper
 from moodle_dl.types import Course, File, MoodleDlOpts
@@ -12,7 +18,76 @@ class StateRecorder:
     """
     Saves the state and provides utilities to detect changes in the current
     state against the previous.
+
+    Every file-state change (new / modified / moved / deleted) is committed
+    together with one outbox row per configured notification service in the
+    same SQLite transaction. The outbox is the transactional bridge between
+    file-state commits and channel delivery; it carries a per-service
+    idempotency key, a payload digest, attempt/backoff bookkeeping, a
+    crash-recoverable lease and the acknowledged state.
     """
+
+    # Outbox delivery lifecycle states
+    OUTBOX_PENDING = 'pending'
+    OUTBOX_LEASED = 'leased'
+    OUTBOX_ACKNOWLEDGED = 'acknowledged'
+    OUTBOX_DEAD = 'dead'
+
+    OUTBOX_ACTIVE_STATUSES = (OUTBOX_PENDING, OUTBOX_LEASED, OUTBOX_DEAD)
+    OUTBOX_RETRYABLE_STATUSES = (OUTBOX_PENDING, OUTBOX_LEASED)
+
+    DEFAULT_MAX_ATTEMPTS = 8
+    DEFAULT_LEASE_SECONDS = 300
+
+    SQL_CREATE_OUTBOX_TABLE = """ CREATE TABLE IF NOT EXISTS outbox (
+            outbox_id integer PRIMARY KEY AUTOINCREMENT,
+            batch_id text NOT NULL,
+            service text NOT NULL,
+            event_type text NOT NULL,
+            file_id integer NOT NULL,
+            course_id integer NOT NULL,
+            idempotency_key text NOT NULL,
+            payload text NOT NULL,
+            payload_digest text NOT NULL,
+            status text NOT NULL DEFAULT 'pending',
+            attempts integer DEFAULT 0 NOT NULL,
+            max_attempts integer DEFAULT 8 NOT NULL,
+            not_before real DEFAULT 0 NOT NULL,
+            lease_expires_at real,
+            leased_by text,
+            last_error text,
+            part_index integer DEFAULT 0 NOT NULL,
+            part_total integer DEFAULT 0 NOT NULL,
+            created_at real NOT NULL,
+            acknowledged_at real,
+            dead_at real,
+            UNIQUE (service, idempotency_key)
+            );
+            """
+
+    SQL_CREATE_OUTBOX_DISPATCH_INDEX = """
+            CREATE INDEX IF NOT EXISTS idx_outbox_dispatch
+            ON outbox (service, status, not_before, lease_expires_at);
+            """
+
+    SQL_CREATE_OUTBOX_FILE_INDEX = """
+            CREATE INDEX IF NOT EXISTS idx_outbox_file
+            ON outbox (file_id);
+            """
+
+    SQL_CREATE_OUTBOX_ACK_INDEX = """
+            CREATE INDEX IF NOT EXISTS idx_outbox_acknowledged
+            ON outbox (acknowledged_at);
+            """
+
+    SQL_ENQUEUE_OUTBOX = """
+            INSERT OR IGNORE INTO outbox
+            (batch_id, service, event_type, file_id, course_id,
+             idempotency_key, payload, payload_digest, status, created_at)
+            VALUES
+            (:batch_id, :service, :event_type, :file_id, :course_id,
+             :idempotency_key, :payload, :payload_digest, 'pending', :created_at);
+            """
 
     def __init__(self, config: ConfigHelper, opts: MoodleDlOpts):
         """
@@ -21,10 +96,20 @@ class StateRecorder:
         @param opts: Moodle-dl options
         """
         self.opts = opts
+        self.config = config
         self.db_file = PT.make_path(config.get_misc_files_path(), 'moodle_state.db')
 
+        # One batch id per process instance, grouping every outbox row
+        # produced by this run (observability across CLI reentry / GUI runs).
+        self.batch_id = uuid.uuid4().hex
+
+        # Lazily resolved list of active channel keys (see notifications
+        # package). Cached for the lifetime of this recorder.
+        self._service_keys = None
+
         try:
-            conn = sqlite3.connect(self.db_file)
+            conn = self._connect()
+            conn.row_factory = sqlite3.Row
 
             c = conn.cursor()
 
@@ -172,6 +257,28 @@ class StateRecorder:
                 current_version = 5
                 conn.commit()
 
+            if current_version == 5:
+                # Transactional outbox: one row per (file version change
+                # event, configured channel). File-state writes and outbox
+                # enqueue happen in the same transaction; the dispatcher
+                # claims rows per channel, sends and acknowledges only after
+                # a successful delivery.
+                c.execute('PRAGMA journal_mode=WAL;')
+                c.execute(self.SQL_CREATE_OUTBOX_TABLE)
+                c.execute(self.SQL_CREATE_OUTBOX_DISPATCH_INDEX)
+                c.execute(self.SQL_CREATE_OUTBOX_FILE_INDEX)
+                c.execute(self.SQL_CREATE_OUTBOX_ACK_INDEX)
+
+                # Migration compatibility: rows that were still pending on
+                # the legacy files.notified flag become pending outbox rows
+                # for every currently active channel. Already notified rows
+                # are treated as acknowledged history and are not enqueued.
+                self._backfill_legacy_notifications(c)
+
+                c.execute('PRAGMA user_version = 6;')
+                current_version = 6
+                conn.commit()
+
             conn.commit()
             logging.debug('Database Version: %s', str(current_version))
 
@@ -179,6 +286,122 @@ class StateRecorder:
 
         except Error as error:
             raise RuntimeError(f'Could not create database! Error: {error}') from error
+
+    def _connect(self) -> sqlite3.Connection:
+        # Opens a database connection. busy_timeout lets concurrent writers
+        # (e.g. a GUI and a CLI run at the same time) wait for the outbox
+        # write lock instead of failing immediately.
+        conn = sqlite3.connect(self.db_file, timeout=30)
+        conn.execute('PRAGMA busy_timeout=30000')
+        return conn
+
+    def _active_service_keys(self) -> List[str]:
+        if self._service_keys is None:
+            try:
+                from moodle_dl.notifications import get_active_service_keys
+
+                self._service_keys = get_active_service_keys(self.config)
+            except Exception:  # pylint: disable=broad-except
+                self._service_keys = None
+
+        if not self._service_keys:
+            # The console channel exists without any configuration and must
+            # always receive changes, even if no remote channel is set up.
+            self._service_keys = ['console']
+        return self._service_keys
+
+    @staticmethod
+    def _event_type_of_file(file: File) -> str:
+        if file.deleted:
+            return 'deleted'
+        if file.moved:
+            return 'moved'
+        if file.modified:
+            return 'modified'
+        return 'new'
+
+    @staticmethod
+    def _build_outbox_payload(file: File, course_id: int, event_type: str, file_id: int):
+        # Canonical descriptor of one file-version event. The digest lets the
+        # dispatcher observe whether a retried delivery still represents the
+        # exact same version of the event. Rendering happens at send time
+        # from the files table, so only identity/version fields are stored.
+        descriptor = {
+            'event': event_type,
+            'file_id': file_id,
+            'course_id': course_id,
+            'module_id': file.module_id,
+            'section_id': file.section_id,
+            'section_name': file.section_name,
+            'module_name': file.module_name,
+            'content_filepath': file.content_filepath,
+            'content_filename': file.content_filename,
+            'content_fileurl': file.content_fileurl,
+            'content_filesize': file.content_filesize,
+            'content_timemodified': file.content_timemodified,
+            'module_modname': file.module_modname,
+            'content_type': file.content_type,
+            'hash': file.hash,
+            'old_file_id': file.old_file_id,
+            'time_stamp': file.time_stamp,
+            'saved_to': file.saved_to,
+        }
+        payload = json.dumps(descriptor, sort_keys=True, separators=(',', ':'))
+        payload_digest = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+        return payload, payload_digest
+
+    def _enqueue_outbox(
+        self,
+        cursor: sqlite3.Cursor,
+        file: File,
+        course_id: int,
+        event_type: str,
+        file_id: Optional[int],
+        created_at: float,
+    ):
+        # MUST run on the same cursor/transaction as the corresponding
+        # files-table write, so file state and notification outbox are
+        # always committed atomically.
+        if file_id is None:
+            return
+
+        payload, payload_digest = self._build_outbox_payload(file, course_id, event_type, file_id)
+        idempotency_key = f'{event_type}:{file_id}'
+
+        for service in self._active_service_keys():
+            cursor.execute(
+                self.SQL_ENQUEUE_OUTBOX,
+                {
+                    'batch_id': self.batch_id,
+                    'service': service,
+                    'event_type': event_type,
+                    'file_id': file_id,
+                    'course_id': course_id,
+                    'idempotency_key': idempotency_key,
+                    'payload': payload,
+                    'payload_digest': payload_digest,
+                    'created_at': created_at,
+                },
+            )
+
+    def _backfill_legacy_notifications(self, cursor: sqlite3.Cursor):
+        # Migrates rows with notified = 0 from pre-outbox databases.
+        legacy_rows = cursor.execute('SELECT * FROM files WHERE notified = 0').fetchall()
+        if not legacy_rows:
+            return
+
+        created_at = time.time()
+        for legacy_row in legacy_rows:
+            legacy_file = File.fromRow(legacy_row)
+            event_type = self._event_type_of_file(legacy_file)
+            self._enqueue_outbox(
+                cursor,
+                legacy_file,
+                legacy_row['course_id'],
+                event_type,
+                legacy_file.file_id,
+                created_at,
+            )
 
     @staticmethod
     def files_have_same_type(file1: File, file2: File) -> bool:
@@ -277,7 +500,7 @@ class StateRecorder:
 
     def get_stored_files(self) -> List[Course]:
         # get all stored files (that are not yet deleted)
-        conn = sqlite3.connect(self.db_file)
+        conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         stored_courses = []
@@ -318,7 +541,7 @@ class StateRecorder:
 
     def get_old_files(self) -> List[Course]:
         # get all stored files (that are not yet deleted)
-        conn = sqlite3.connect(self.db_file)
+        conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         stored_courses = []
@@ -523,7 +746,7 @@ class StateRecorder:
         }
         """
 
-        conn = sqlite3.connect(self.db_file)
+        conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         mod_forum_dict = {}
@@ -554,16 +777,34 @@ class StateRecorder:
 
         return {'forum': mod_forum_dict, 'calendar': mod_calendar_dict}
 
-    def changes_to_notify(self) -> List[Course]:
+    def changes_to_notify(self, file_ids: Optional[List[int]] = None) -> List[Course]:
+        # Rebuilds the change set (with new/old version references) for
+        # rendering. When file_ids is given, only the file-version rows
+        # claimed by the dispatcher for one channel are reconstructed; this
+        # is what keeps per-channel rendering independent of other channels'
+        # backoff/lease state.
         changed_courses = []
 
-        conn = sqlite3.connect(self.db_file)
+        conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
+        id_filter = ''
+        filter_params = []
+        if file_ids is not None:
+            if len(file_ids) == 0:
+                conn.close()
+                return []
+            placeholders = ','.join('?' for _ in file_ids)
+            id_filter = f'AND file_id IN ({placeholders})'
+            filter_params = list(file_ids)
+
         cursor.execute(
-            """SELECT course_id, course_fullname
-            FROM files WHERE notified = 0 GROUP BY course_id;"""
+            f"""SELECT course_id, course_fullname
+            FROM files WHERE notified = 0 {id_filter}
+            GROUP BY course_id
+            ORDER BY course_id;""",
+            filter_params,
         )
 
         curse_rows = cursor.fetchall()
@@ -572,9 +813,10 @@ class StateRecorder:
             course = Course(course_row['course_id'], course_row['course_fullname'])
 
             cursor.execute(
-                """SELECT *
-                FROM files WHERE notified = 0 AND course_id = ?;""",
-                (course.id,),
+                f"""SELECT *
+                FROM files WHERE notified = 0 AND course_id = ? {id_filter}
+                ORDER BY file_id;""",
+                [course.id] + filter_params,
             )
 
             file_rows = cursor.fetchall()
@@ -584,7 +826,7 @@ class StateRecorder:
             for file_row in file_rows:
                 notify_file = File.fromRow(file_row)
                 if notify_file.modified or notify_file.moved:
-                    # add reference to new file
+                    # add reference to the new version of the file
 
                     cursor.execute(
                         """SELECT *
@@ -605,9 +847,11 @@ class StateRecorder:
         return changed_courses
 
     def notified(self, courses: List[Course]):
-        # saves that a notification with the changes where send
+        # Legacy compatibility: pre-outbox callers could mark files as
+        # notified directly. New code goes through the outbox (ack_outbox),
+        # which maintains files.notified as an aggregate across channels.
 
-        conn = sqlite3.connect(self.db_file)
+        conn = self._connect()
         cursor = conn.cursor()
 
         for course in courses:
@@ -639,9 +883,9 @@ class StateRecorder:
             self.new_file(file, course_id, course_fullname)
 
     def new_file(self, file: File, course_id: int, course_fullname: str):
-        # saves a file to index
+        # saves a file to index and atomically enqueues its notification
 
-        conn = sqlite3.connect(self.db_file)
+        conn = self._connect()
         cursor = conn.cursor()
 
         data = {'course_id': course_id, 'course_fullname': course_fullname}
@@ -650,14 +894,19 @@ class StateRecorder:
         data.update({'modified': 0, 'deleted': 0, 'moved': 0, 'notified': 0})
 
         cursor.execute(File.INSERT, data)
+        new_file_id = cursor.lastrowid
+        file.file_id = new_file_id
+
+        self._enqueue_outbox(cursor, file, course_id, 'new', new_file_id, time.time())
 
         conn.commit()
         conn.close()
 
     def batch_delete_files(self, courses: List[Course]):
-        conn = sqlite3.connect(self.db_file)
+        conn = self._connect()
         cursor = conn.cursor()
 
+        created_at = time.time()
         for course in courses:
             for file in course.files:
                 if file.deleted:
@@ -672,11 +921,15 @@ class StateRecorder:
                         data,
                     )
 
+                    # Delete events are enqueued in the same transaction as
+                    # the files-row update.
+                    self._enqueue_outbox(cursor, file, course.id, 'deleted', file.file_id, created_at)
+
         conn.commit()
         conn.close()
 
     def batch_delete_files_from_db(self, files: List[File]):
-        conn = sqlite3.connect(self.db_file)
+        conn = self._connect()
         cursor = conn.cursor()
 
         for file in files:
@@ -702,7 +955,7 @@ class StateRecorder:
         conn.close()
 
     def delete_file(self, file: File, course_id: int, course_fullname: str):
-        conn = sqlite3.connect(self.db_file)
+        conn = self._connect()
         cursor = conn.cursor()
 
         data = {'course_id': course_id, 'course_fullname': course_fullname}
@@ -716,13 +969,16 @@ class StateRecorder:
             data,
         )
 
+        self._enqueue_outbox(cursor, file, course_id, 'deleted', file.file_id, time.time())
+
         conn.commit()
         conn.close()
 
     def move_file(self, file: File, course_id: int, course_fullname: str):
-        conn = sqlite3.connect(self.db_file)
+        conn = self._connect()
         cursor = conn.cursor()
 
+        created_at = time.time()
         data_new = {'course_id': course_id, 'course_fullname': course_fullname}
         data_new.update(file.getMap())
 
@@ -732,6 +988,7 @@ class StateRecorder:
                 {'old_file_id': file.old_file.file_id, 'modified': 0, 'moved': 0, 'deleted': 0, 'notified': 1}
             )
             cursor.execute(File.INSERT, data_new)
+            file.file_id = cursor.lastrowid
 
             data_old = {'course_id': course_id, 'course_fullname': course_fullname}
             data_old.update(file.old_file.getMap())
@@ -743,19 +1000,28 @@ class StateRecorder:
             """,
                 data_old,
             )
+
+            # The move event belongs to the old file version; the new
+            # version row is the rendering reference (new_file) only.
+            self._enqueue_outbox(cursor, file.old_file, course_id, 'moved', file.old_file.file_id, created_at)
         else:
             # this should never happen, but the old file is not saved in the
             # file descriptor, so we need to inform about the new file notified = 0
             data_new.update({'modified': 0, 'deleted': 0, 'moved': 0, 'notified': 0})
             cursor.execute(File.INSERT, data_new)
+            new_file_id = cursor.lastrowid
+            file.file_id = new_file_id
+
+            self._enqueue_outbox(cursor, file, course_id, 'moved', new_file_id, created_at)
 
         conn.commit()
         conn.close()
 
     def modifie_file(self, file: File, course_id: int, course_fullname: str):
-        conn = sqlite3.connect(self.db_file)
+        conn = self._connect()
         cursor = conn.cursor()
 
+        created_at = time.time()
         data_new = {'course_id': course_id, 'course_fullname': course_fullname}
         data_new.update(file.getMap())
 
@@ -767,6 +1033,7 @@ class StateRecorder:
                 {'old_file_id': file.old_file.file_id, 'modified': 0, 'moved': 0, 'deleted': 0, 'notified': 1}
             )
             cursor.execute(File.INSERT, data_new)
+            file.file_id = cursor.lastrowid
 
             data_old = {'course_id': course_id, 'course_fullname': course_fullname}
             data_old.update(file.old_file.getMap())
@@ -779,6 +1046,10 @@ class StateRecorder:
             """,
                 data_old,
             )
+
+            # The modification event belongs to the old file version; the
+            # new version row is the rendering reference (new_file) only.
+            self._enqueue_outbox(cursor, file.old_file, course_id, 'modified', file.old_file.file_id, created_at)
         else:
             # this should never happen, but the old file is not saved in the
             # file descriptor, so we need to inform about the new file
@@ -786,6 +1057,321 @@ class StateRecorder:
 
             data_new.update({'modified': 0, 'deleted': 0, 'moved': 0, 'notified': 0})
             cursor.execute(File.INSERT, data_new)
+            new_file_id = cursor.lastrowid
+            file.file_id = new_file_id
+
+            self._enqueue_outbox(cursor, file, course_id, 'modified', new_file_id, created_at)
 
         conn.commit()
         conn.close()
+
+    # ------------------------------------------------------------------
+    # Outbox lifecycle
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _outbox_worker_id() -> str:
+        return f'{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:12]}'
+
+    def claim_outbox(
+        self,
+        service: str,
+        now: float,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        limit: int = 50,
+    ) -> List[Dict]:
+        """
+        Atomically claims due rows for one channel.
+
+        Due rows are pending rows whose backoff has elapsed and leased rows
+        whose committed lease has expired (owner crashed). The lease is
+        committed before the network send, so a crash after a successful
+        send but before the ack makes the row reclaimable by this run, a
+        later CLI reentry or the GUI - at-least-once delivery.
+        """
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        worker_id = self._outbox_worker_id()
+        lease_expires_at = now + lease_seconds
+
+        cursor.execute(
+            """
+            UPDATE outbox
+            SET status = 'leased',
+                leased_by = :worker_id,
+                lease_expires_at = :lease_expires_at,
+                last_error = NULL,
+                part_index = 0
+            WHERE outbox_id IN (
+                SELECT outbox_id
+                FROM outbox
+                WHERE service = :service
+                  AND status IN ('pending', 'leased')
+                  AND not_before <= :now
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= :now)
+                ORDER BY created_at ASC, outbox_id ASC
+                LIMIT :limit
+            );
+            """,
+            {
+                'service': service,
+                'now': now,
+                'worker_id': worker_id,
+                'lease_expires_at': lease_expires_at,
+                'limit': limit,
+            },
+        )
+
+        rows = cursor.execute(
+            """SELECT * FROM outbox
+            WHERE leased_by = :worker_id AND status = 'leased'
+            ORDER BY created_at ASC, outbox_id ASC;""",
+            {'worker_id': worker_id},
+        ).fetchall()
+
+        conn.commit()
+        conn.close()
+
+        return [dict(row) for row in rows]
+
+    def mark_outbox_parts(self, outbox_ids: List[int], part_total: int):
+        # Persists the shard count for a claimed batch, so a crash can be
+        # observed as "leased with N planned shards, K sent".
+        if not outbox_ids:
+            return
+        conn = self._connect()
+        cursor = conn.cursor()
+        placeholders = ','.join('?' for _ in outbox_ids)
+        cursor.execute(
+            f"""UPDATE outbox
+            SET part_total = ?, part_index = 0
+            WHERE outbox_id IN ({placeholders}) AND status = 'leased';""",
+            [part_total] + list(outbox_ids),
+        )
+        conn.commit()
+        conn.close()
+
+    def update_outbox_progress(self, outbox_ids: List[int], part_index: int):
+        if not outbox_ids:
+            return
+        conn = self._connect()
+        cursor = conn.cursor()
+        placeholders = ','.join('?' for _ in outbox_ids)
+        cursor.execute(
+            f"""UPDATE outbox
+            SET part_index = ?
+            WHERE outbox_id IN ({placeholders}) AND status = 'leased';""",
+            [part_index] + list(outbox_ids),
+        )
+        conn.commit()
+        conn.close()
+
+    def ack_outbox(self, outbox_ids: List[int], now: float):
+        """
+        Confirms successful delivery. Acknowledging is only allowed after a
+        successful send. files.notified is maintained for legacy readers as
+        an aggregate: it flips to 1 only when no pending / leased / dead
+        outbox row remains for the file version.
+        """
+        if not outbox_ids:
+            return
+        conn = self._connect()
+        cursor = conn.cursor()
+        ids = list(outbox_ids)
+        id_names = ','.join(f':id{index}' for index in range(len(ids)))
+        params = {'now': now}
+        for index, outbox_id in enumerate(ids):
+            params[f'id{index}'] = outbox_id
+
+        cursor.execute(
+            f"""UPDATE outbox
+            SET status = 'acknowledged',
+                acknowledged_at = :now,
+                lease_expires_at = NULL,
+                leased_by = NULL,
+                last_error = NULL,
+                part_index = part_total
+            WHERE outbox_id IN ({id_names});""",
+            params,
+        )
+
+        cursor.execute(
+            f"""UPDATE files
+            SET notified = 1
+            WHERE notified = 0
+              AND file_id IN (
+                  SELECT DISTINCT file_id FROM outbox WHERE outbox_id IN ({id_names})
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM outbox AS o
+                  WHERE o.file_id = files.file_id
+                    AND o.status IN ('pending', 'leased', 'dead')
+              );""",
+            params,
+        )
+
+        conn.commit()
+        conn.close()
+
+    def fail_outbox(
+        self,
+        outbox_ids: List[int],
+        now: float,
+        not_before: float,
+        error: str,
+        rate_limited: bool = False,
+    ):
+        """
+        Records a failed delivery attempt.
+
+        Normal failures increment attempts and apply exponential backoff;
+        rows that reach max_attempts become a queryable 'dead' terminal
+        state. Rate-limit (HTTP 429 style) failures do not consume an
+        attempt, they reschedule at the server-indicated time.
+        """
+        if not outbox_ids:
+            return
+        conn = self._connect()
+        cursor = conn.cursor()
+        ids = list(outbox_ids)
+        id_names = ','.join(f':id{index}' for index in range(len(ids)))
+
+        params = {
+            'rate_limited': 1 if rate_limited else 0,
+            'now': now,
+            'not_before': not_before,
+            'error': error[:2000],
+        }
+        for index, outbox_id in enumerate(ids):
+            params[f'id{index}'] = outbox_id
+
+        cursor.execute(
+            f"""UPDATE outbox
+            SET attempts = CASE WHEN :rate_limited = 1 THEN attempts ELSE attempts + 1 END,
+                status = CASE
+                    WHEN :rate_limited = 1 OR attempts + 1 < max_attempts THEN 'pending'
+                    ELSE 'dead'
+                END,
+                dead_at = CASE
+                    WHEN :rate_limited = 0 AND attempts + 1 >= max_attempts THEN :now
+                    ELSE dead_at
+                END,
+                not_before = :not_before,
+                lease_expires_at = NULL,
+                leased_by = NULL,
+                last_error = :error,
+                part_index = 0
+            WHERE outbox_id IN ({id_names});""",
+            params,
+        )
+
+        conn.commit()
+        conn.close()
+
+    def release_outbox(self, outbox_ids: List[int]):
+        """
+        Releases a claim back to pending without consuming an attempt and
+        without backoff. Used when a GUI cancel happens before/while the
+        batch is sent; another run picks the rows up immediately.
+        """
+        if not outbox_ids:
+            return
+        conn = self._connect()
+        cursor = conn.cursor()
+        placeholders = ','.join('?' for _ in outbox_ids)
+        cursor.execute(
+            f"""UPDATE outbox
+            SET status = 'pending',
+                lease_expires_at = NULL,
+                leased_by = NULL,
+                part_index = 0
+            WHERE outbox_id IN ({placeholders}) AND status = 'leased';""",
+            list(outbox_ids),
+        )
+        conn.commit()
+        conn.close()
+
+    def prune_outbox(self, older_than_timestamp: Optional[float] = None) -> int:
+        # Historical cleanup: acknowledged rows past the retention point are
+        # deleted. Dead rows are intentionally kept - they are the
+        # queryable terminal state for poison messages and must be requeued
+        # explicitly.
+        conn = self._connect()
+        cursor = conn.cursor()
+        if older_than_timestamp is None:
+            older_than_timestamp = time.time() - 7 * 24 * 60 * 60
+        cursor.execute(
+            """DELETE FROM outbox
+            WHERE status = 'acknowledged' AND acknowledged_at < :cutoff;""",
+            {'cutoff': older_than_timestamp},
+        )
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return deleted
+
+    def requeue_dead_outbox(self, service: Optional[str] = None) -> int:
+        # CLI reentry / manual recovery: make dead rows eligible again.
+        conn = self._connect()
+        cursor = conn.cursor()
+        if service is None:
+            cursor.execute(
+                """UPDATE outbox
+                SET status = 'pending',
+                    attempts = 0,
+                    dead_at = NULL,
+                    not_before = 0,
+                    lease_expires_at = NULL,
+                    leased_by = NULL,
+                    last_error = NULL,
+                    part_index = 0
+                WHERE status = 'dead';"""
+            )
+        else:
+            cursor.execute(
+                """UPDATE outbox
+                SET status = 'pending',
+                    attempts = 0,
+                    dead_at = NULL,
+                    not_before = 0,
+                    lease_expires_at = NULL,
+                    leased_by = NULL,
+                    last_error = NULL,
+                    part_index = 0
+                WHERE status = 'dead' AND service = :service;""",
+                {'service': service},
+            )
+        changed = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return changed
+
+    def outbox_stats(self) -> Dict[str, Dict[str, int]]:
+        # Observability: counts per service and lifecycle status.
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        rows = cursor.execute(
+            """SELECT service, status, COUNT(*) AS amount
+            FROM outbox GROUP BY service, status;"""
+        ).fetchall()
+        conn.close()
+
+        result = {}
+        for row in rows:
+            result.setdefault(row['service'], {})[row['status']] = row['amount']
+        return result
+
+    def pending_outbox_services(self) -> List[str]:
+        # Returns channel keys that still own retryable rows. Used to report
+        # rows that wait for channels currently not configured/active.
+        conn = self._connect()
+        cursor = conn.cursor()
+        rows = cursor.execute(
+            """SELECT DISTINCT service FROM outbox
+            WHERE status IN ('pending', 'leased');"""
+        ).fetchall()
+        conn.close()
+        return [row[0] for row in rows]

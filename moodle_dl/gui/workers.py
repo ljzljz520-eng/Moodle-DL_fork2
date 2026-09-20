@@ -309,7 +309,12 @@ class TestXmppWorker(AsyncWorker):
 
 
 class NotifyWorker(AsyncWorker):
-    """Sends post-download notifications via all configured services."""
+    """
+    Drains the notification outbox via the same dispatcher the CLI uses.
+    Cancellation releases un-sent claims (no attempt consumed); rows that
+    were already mid-flight are redelivered after lease expiry, preserving
+    at-least-once semantics.
+    """
 
     notify_finished = Signal()
 
@@ -317,24 +322,18 @@ class NotifyWorker(AsyncWorker):
         super().__init__()
         self.config = config
         self.database = database
+        self._cancel_requested = False
 
     async def do_work(self) -> None:
-        from moodle_dl.notifications import get_all_notify_services
+        from moodle_dl.notifications.outbox_dispatcher import NotificationDispatcher
 
-        services = get_all_notify_services(self.config)
-        changes = self.database.changes_to_notify()
-        if not changes:
-            self.notify_finished.emit()
-            return
-
-        for service in services:
-            try:
-                service.notify_about_changes_in_moodle(changes)
-            except Exception as e:
-                logging.warning('Notification service %s failed: %s', type(service).__name__, e)
-
-        self.database.notified(changes)
+        dispatcher = NotificationDispatcher(self.config, self.database)
+        dispatcher.dispatch(is_cancelled=lambda: self._cancel_requested)
         self.notify_finished.emit()
+
+    def request_cancel(self) -> None:
+        """Request cancellation; un-sent claims are released immediately."""
+        self._cancel_requested = True
 
 
 class FetchSectionsWorker(AsyncWorker):

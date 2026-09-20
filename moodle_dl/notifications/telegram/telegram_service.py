@@ -1,6 +1,5 @@
 import logging
-import traceback
-from typing import List
+from typing import List, Optional
 
 from moodle_dl.downloader.task import Task
 from moodle_dl.notifications.notification_service import NotificationService
@@ -10,6 +9,13 @@ from moodle_dl.types import Course
 
 
 class TelegramService(NotificationService):
+    service_key = 'telegram'
+
+    # Telegram messages must not exceed 4096 characters.
+    message_size_limit = 4096
+    # Stay well below the global 30 messages/second bot limit.
+    min_send_interval = 0.1
+
     def _is_configured(self) -> bool:
         # Checks if the sending of Telegram messages has been configured.
         try:
@@ -19,6 +25,10 @@ class TelegramService(NotificationService):
             logging.debug('Telegram-Notifications not configured, skipping.')
             return False
 
+    def _build_shooter(self) -> TelegramShooter:
+        telegram_cfg = self.config.get_property('telegram')
+        return TelegramShooter(telegram_cfg['token'], telegram_cfg['chat_id'])
+
     def _send_messages(self, messages: List[str]):
         """
         Sends an message
@@ -26,30 +36,26 @@ class TelegramService(NotificationService):
         if not self._is_configured() or messages is None or len(messages) == 0:
             return
 
-        telegram_cfg = self.config.get_property('telegram')
-
         logging.info('Sending Notification via Telegram...')
+        self.send_messages(messages)
 
-        telegram_shooter = TelegramShooter(telegram_cfg['token'], telegram_cfg['chat_id'])
+    def render_changes_messages(self, changes: List[Course]) -> List[str]:
+        return TF.create_full_moodle_diff_messages(changes)
 
-        for message_content in messages:
-            try:
-                telegram_shooter.send(message_content)
-            except BaseException as e:
-                logging.error('While sending notification:\n%s', traceback.format_exc(), extra={'exception': e})
-                raise e  # to be properly notified via Sentry
+    def _send_message_item(self, item: str, idempotency_key: Optional[str] = None) -> None:
+        self._build_shooter().send(item)
 
-    def notify_about_changes_in_moodle(self, changes: List[Course]) -> None:
+    def notify_about_changes_in_moodle(self, changes: List[Course], idempotency_key: Optional[str] = None) -> None:
         """
         Sends out a notification about the downloaded changes.
         @param changes: A list of changed courses with changed files.
+        @param idempotency_key: Stable outbox batch key, reused on retries.
         """
         if not self._is_configured():
             return
 
-        messages = TF.create_full_moodle_diff_messages(changes)
-
-        self._send_messages(messages)
+        logging.info('Sending Notification via Telegram...')
+        self.send_messages(self.render_changes_messages(changes), idempotency_key)
 
     def notify_about_error(self, error_description: str):
         """

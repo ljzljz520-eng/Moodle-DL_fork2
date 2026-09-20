@@ -31,3 +31,15 @@ def get_all_notify_services(config: ConfigHelper) -> List[NotificationService]:
     for service in ALL_SERVICES:
         result_list.append(service(config))
     return result_list
+
+
+def get_active_notify_services(config: ConfigHelper) -> List[NotificationService]:
+    # Returns all service instances that are currently configured/active.
+    # The console channel is always active.
+    return [service for service in get_all_notify_services(config) if service.is_active()]
+
+
+def get_active_service_keys(config: ConfigHelper) -> List[str]:
+    # Stable channel keys for which file-change events must be enqueued and
+    # claimed by the outbox dispatcher.
+    return [service.service_key for service in get_active_notify_services(config)]

@@ -42,6 +42,7 @@ class DownloadPage(QWidget):
         self._download_service = None
         self._fetched_courses = None
         self._fetched_database = None
+        self._cancel_requested = False
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(500)
         self._poll_timer.timeout.connect(self._poll_status)
@@ -142,6 +143,7 @@ class DownloadPage(QWidget):
 
     def _on_scan(self) -> None:
         """Start scanning Moodle for changes."""
+        self._cancel_requested = False
         self._phase = Phase.SCANNING
         self.scan_btn.setEnabled(False)
         self.start_btn.setEnabled(False)
@@ -269,9 +271,11 @@ class DownloadPage(QWidget):
 
         self._download_service = None
 
-        # Trigger post-download notifications
+        # Trigger post-download notifications. When the run was cancelled,
+        # the outbox rows committed together with the downloaded files stay
+        # pending and are delivered by the next run.
         database = self._fetched_database
-        if database is not None:
+        if database is not None and not self._cancel_requested:
             self._notify_worker = NotifyWorker(self.config, database)
             self._notify_worker.notify_finished.connect(self._on_notify_done)
             self._notify_worker.error_occurred.connect(self._on_notify_done)
@@ -440,13 +444,18 @@ class DownloadPage(QWidget):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+        self._cancel_requested = True
         if self._download_worker is not None:
             self._download_worker.request_cancel()
-            self.cancel_btn.setEnabled(False)
-            set_status_text(self.stats_label, self.tr('Cancelling\u2026'), 'warning')
+        if self._notify_worker is not None and self._notify_worker.isRunning():
+            # Release claimed outbox rows instead of acknowledging them.
+            self._notify_worker.request_cancel()
+        self.cancel_btn.setEnabled(False)
+        set_status_text(self.stats_label, self.tr('Cancelling\u2026'), 'warning')
 
     def cancel_all(self) -> None:
         """Called when the window is closing."""
+        self._cancel_requested = True
         if self._fetch_worker is not None and self._fetch_worker.isRunning():
             self._fetch_worker.quit()
             self._fetch_worker.wait(3000)
@@ -455,7 +464,9 @@ class DownloadPage(QWidget):
             self._download_worker.quit()
             self._download_worker.wait(3000)
         if self._notify_worker is not None and self._notify_worker.isRunning():
-            self._notify_worker.quit()
+            # Cooperative cancel: claims are released without consuming an
+            # attempt; wait so no SQLite connection dies mid-statement.
+            self._notify_worker.request_cancel()
             self._notify_worker.wait(3000)
 
     # -------------------------------------------------------------------

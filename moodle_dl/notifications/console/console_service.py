@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from moodle_dl.downloader.task import Task
 from moodle_dl.notifications.notification_service import NotificationService
@@ -8,7 +8,9 @@ from moodle_dl.utils import PathTools as PT
 
 
 class ConsoleService(NotificationService):
-    def notify_about_changes_in_moodle(self, changes: List[Course]) -> None:
+    service_key = 'console'
+
+    def notify_about_changes_in_moodle(self, changes: List[Course], idempotency_key: Optional[str] = None) -> None:
         """
         Creates a terminal output about the downloaded changes.
         @param changes: A list of changed courses with changed files.

@@ -1,6 +1,6 @@
 import logging
 import traceback
-from typing import List
+from typing import List, Optional
 
 from moodle_dl.downloader.task import Task
 from moodle_dl.notifications.mail.mail_formater import (
@@ -14,6 +14,8 @@ from moodle_dl.types import Course
 
 
 class MailService(NotificationService):
+    service_key = 'mail'
+
     def _is_configured(self) -> bool:
         # Checks if the sending of emails has been configured.
         try:
@@ -23,6 +25,16 @@ class MailService(NotificationService):
             logging.debug('Mail-Notifications not configured, skipping.')
             return False
 
+    def _build_shooter(self) -> MailShooter:
+        mail_cfg = self.config.get_property('mail')
+        return MailShooter(
+            mail_cfg['sender'],
+            mail_cfg['server_host'],
+            int(mail_cfg['server_port']),
+            mail_cfg['username'],
+            mail_cfg['password'],
+        )
+
     def _send_mail(self, subject, mail_content: (str, {str: str})):
         """
         Sends an email
@@ -30,38 +42,46 @@ class MailService(NotificationService):
         if not self._is_configured():
             return
 
-        mail_cfg = self.config.get_property('mail')
-
         try:
             logging.info('Sending Notification via Mail...')
 
-            mail_shooter = MailShooter(
-                mail_cfg['sender'],
-                mail_cfg['server_host'],
-                int(mail_cfg['server_port']),
-                mail_cfg['username'],
-                mail_cfg['password'],
-            )
-            mail_shooter.send(mail_cfg['target'], subject, mail_content[0], mail_content[1])
+            mail_cfg = self.config.get_property('mail')
+            self._build_shooter().send(mail_cfg['target'], subject, mail_content[0], mail_content[1])
         except BaseException as e:
             logging.error('While sending notification:\n%s', traceback.format_exc(), extra={'exception': e})
             raise e  # to be properly notified via Sentry
 
-    def notify_about_changes_in_moodle(self, changes: List[Course]) -> None:
-        """
-        Sends out a notification email about the downloaded changes.
-        @param changes: A list of changed courses with changed files.
-        """
-        if not self._is_configured():
-            return
-
-        mail_content = create_full_moodle_diff_mail(changes)
+    def render_changes_messages(self, changes: List[Course]) -> List[dict]:
+        mail_cfg = self.config.get_property('mail')
+        html_content, inline_images = create_full_moodle_diff_mail(changes)
 
         diff_count = 0
         for course in changes:
             diff_count += len(course.files)
 
-        self._send_mail(f'{diff_count} new Changes in the Moodle courses!', mail_content)
+        return [
+            {
+                'target': mail_cfg['target'],
+                'subject': f'{diff_count} new Changes in the Moodle courses!',
+                'html': html_content,
+                'images': inline_images,
+            }
+        ]
+
+    def _send_message_item(self, item: dict, idempotency_key: Optional[str] = None) -> None:
+        logging.info('Sending Notification via Mail...')
+        self._build_shooter().send(item['target'], item['subject'], item['html'], item['images'])
+
+    def notify_about_changes_in_moodle(self, changes: List[Course], idempotency_key: Optional[str] = None) -> None:
+        """
+        Sends out a notification email about the downloaded changes.
+        @param changes: A list of changed courses with changed files.
+        @param idempotency_key: Stable outbox batch key, reused on retries.
+        """
+        if not self._is_configured():
+            return
+
+        self.send_messages(self.render_changes_messages(changes), idempotency_key)
 
     def notify_about_error(self, error_description: str):
         """

@@ -280,6 +280,7 @@ class MoodleDlOpts:
     log_to_file: bool
     log_file_path: str
     gui: bool
+    requeue_dead_notifications: bool
 
 
 class TaskState(Enum):

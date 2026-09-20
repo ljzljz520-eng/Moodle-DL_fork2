@@ -1,7 +1,9 @@
+import logging
 import urllib
 
 from requests.exceptions import RequestException
 
+from moodle_dl.notifications.notification_service import NotificationRateLimitError
 from moodle_dl.utils import SslHelper
 
 
@@ -36,6 +38,25 @@ class TelegramShooter:
     @staticmethod
     def _check_response_code(response):
         # Normally Telegram answer with response 200
+        if response.status_code == 429:
+            # Rate limit: Telegram returns parameters.retry_after (seconds).
+            # The outbox dispatcher reschedules without consuming an attempt.
+            retry_after = None
+            try:
+                retry_after = response.json().get('parameters', {}).get('retry_after')
+            except Exception:  # pylint: disable=broad-except
+                logging.debug('Could not parse Telegram 429 response body.')
+            if retry_after is not None:
+                try:
+                    retry_after = float(retry_after)
+                except (TypeError, ValueError):
+                    retry_after = None
+            raise NotificationRateLimitError(
+                'The Telegram System rejected the Request because of a rate limit.'
+                + f' Retry after {retry_after} seconds.',
+                retry_after=retry_after,
+            )
+
         if response.status_code not in [200, 400]:
             raise RuntimeError(
                 'An Unexpected Error happened on side of the Telegram System!'

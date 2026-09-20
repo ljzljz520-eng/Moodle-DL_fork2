@@ -1,6 +1,5 @@
 import logging
-import traceback
-from typing import List
+from typing import List, Optional
 
 from moodle_dl.downloader.task import Task
 from moodle_dl.notifications.notification_service import NotificationService
@@ -10,6 +9,17 @@ from moodle_dl.types import Course
 
 
 class XmppService(NotificationService):
+    service_key = 'xmpp'
+
+    # Keep individual stanzas comfortably below common server limits.
+    message_size_limit = 4000
+    # Avoid flooding an XMPP session with a burst of stanzas.
+    min_send_interval = 0.2
+
+    def __init__(self, config):
+        super().__init__(config)
+        self._shooter_instance = None
+
     def _is_configured(self) -> bool:
         # Checks if the sending of XMPP messages has been configured.
         try:
@@ -19,6 +29,13 @@ class XmppService(NotificationService):
             logging.debug('XMPP-Notifications not configured, skipping.')
             return False
 
+    def _build_shooter(self) -> XmppShooter:
+        # Reuse one connection (and its auth) for a whole batch.
+        if self._shooter_instance is None:
+            xmpp_cfg = self.config.get_property('xmpp')
+            self._shooter_instance = XmppShooter(xmpp_cfg['sender'], xmpp_cfg['password'], xmpp_cfg['target'])
+        return self._shooter_instance
+
     def _send_messages(self, messages: List[str]):
         """
         Sends an message
@@ -26,29 +43,26 @@ class XmppService(NotificationService):
         if not self._is_configured() or messages is None or len(messages) == 0:
             return
 
-        xmpp_cfg = self.config.get_property('xmpp')
-
         logging.info('Sending Notification via XMPP...')
+        self.send_messages(messages)
 
-        xmpp_shooter = XmppShooter(xmpp_cfg['sender'], xmpp_cfg['password'], xmpp_cfg['target'])
-        for message_content in messages:
-            try:
-                xmpp_shooter.send(message_content)
-            except BaseException as e:
-                logging.error('While sending notification:\n%s', traceback.format_exc(), extra={'exception': e})
-                raise e  # to be properly notified via Sentry
+    def render_changes_messages(self, changes: List[Course]) -> List[str]:
+        return XF.create_full_moodle_diff_messages(changes)
 
-    def notify_about_changes_in_moodle(self, changes: List[Course]) -> None:
+    def _send_message_item(self, item: str, idempotency_key: Optional[str] = None) -> None:
+        self._build_shooter().send(item)
+
+    def notify_about_changes_in_moodle(self, changes: List[Course], idempotency_key: Optional[str] = None) -> None:
         """
         Sends out a notification about the downloaded changes.
         @param changes: A list of changed courses with changed files.
+        @param idempotency_key: Stable outbox batch key, reused on retries.
         """
         if not self._is_configured():
             return
 
-        messages = XF.create_full_moodle_diff_messages(changes)
-
-        self._send_messages(messages)
+        logging.info('Sending Notification via XMPP...')
+        self.send_messages(self.render_changes_messages(changes), idempotency_key)
 
     def notify_about_error(self, error_description: str):
         """

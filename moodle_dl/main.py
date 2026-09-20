@@ -33,6 +33,7 @@ from moodle_dl.downloader.download_service import DownloadService
 from moodle_dl.downloader.fake_download_service import FakeDownloadService
 from moodle_dl.moodle.moodle_service import MoodleService
 from moodle_dl.notifications import get_all_notify_services
+from moodle_dl.notifications.outbox_dispatcher import NotificationDispatcher
 from moodle_dl.types import MoodleDlOpts
 from moodle_dl.utils import PathTools as PT
 from moodle_dl.utils import ProcessLock, check_debug
@@ -66,6 +67,8 @@ def choose_task(config: ConfigHelper, opts: MoodleDlOpts):
         DatabaseManager(config, opts).delete_old_files()
     elif opts.manage_database:
         DatabaseManager(config, opts).interactively_manage_database()
+    elif opts.requeue_dead_notifications:
+        requeue_dead_notifications(config, opts)
     elif opts.new_token:
         MoodleWizard(config, opts).interactively_acquire_token(use_stored_url=True)
     else:
@@ -82,6 +85,16 @@ def connect_sentry(config: ConfigHelper) -> bool:
     except (ValueError, sentry_sdk.utils.BadDsn, sentry_sdk.utils.ServerlessTimeoutWarning):
         pass
     return False
+
+
+def requeue_dead_notifications(config: ConfigHelper, opts: MoodleDlOpts):
+    "CLI reentry: make dead-letter outbox rows eligible for delivery again"
+    database = StateRecorder(config, opts)
+    count = database.requeue_dead_outbox()
+    if count:
+        logging.info('Requeued %d dead outbox row(s); they will be delivered on the next run.', count)
+    else:
+        logging.info('No dead outbox rows found.')
 
 
 def run_main(config: ConfigHelper, opts: MoodleDlOpts):
@@ -111,16 +124,21 @@ def run_main(config: ConfigHelper, opts: MoodleDlOpts):
         downloader.run()
         failed_downloads = downloader.get_failed_tasks()
 
-        changed_courses_to_notify = database.changes_to_notify()
+        # Transactional outbox delivery, shared with the GUI. Each active
+        # channel claims its own rows, sends and acknowledges only on
+        # success; crashed/interrupted runs (including rows parked in
+        # backoff or an expired lease) are drained here as well.
+        dispatcher = NotificationDispatcher(config, database)
+        dispatch_result = dispatcher.dispatch()
+        logging.debug('Outbox dispatch summary: %s', dispatch_result.summary())
 
-        if len(changed_courses_to_notify) > 0:
-            for service in notify_services:
-                service.notify_about_changes_in_moodle(changed_courses_to_notify)
-
-            database.notified(changed_courses_to_notify)
-
-        else:
+        if dispatch_result.claimed_total == 0 and not dispatcher.has_pending_work():
             logging.info('No changes found for the configured Moodle-Account.')
+        elif dispatch_result.dead_total > 0:
+            logging.warning(
+                'Some notification outbox rows exhausted their retries and moved to the dead-letter state.'
+                ' Use --requeue-dead-notifications after fixing the channel to retry them.'
+            )
 
         if len(failed_downloads) > 0:
             for service in notify_services:
@@ -307,6 +325,17 @@ def get_parser():
         help=(
             'Delete old copies of files. It allows you to delete entries from the database'
             + ' and from local file system.'
+        ),
+    )
+
+    group.add_argument(
+        '--requeue-dead-notifications',
+        dest='requeue_dead_notifications',
+        default=False,
+        action='store_true',
+        help=(
+            'Requeue notification outbox rows that exhausted their delivery retries (dead-letter state)'
+            + ' so they are delivered on the next run, then exit.'
         ),
     )
 
